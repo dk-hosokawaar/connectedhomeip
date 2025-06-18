@@ -28,6 +28,7 @@
 #include <protocols/interaction_model/StatusCode.h>
 #include <tracing/macros.h>
 #include <app/clusters/bindings/BindingManager.h>
+#include "../../../examples/all-clusters-app/all-clusters-common/include/binding-handler.h"
 
 
 #ifdef MATTER_DM_PLUGIN_SCENES_MANAGEMENT
@@ -421,10 +422,16 @@ Status OnOffServer::setOnOffValue(chip::EndpointId endpoint, chip::CommandId com
         if (status != Status::Success)
         {
             ChipLogProgress(Zcl, "ERR: writing on/off %x", to_underlying(status));
+            
             return status;
         }
+        else{
+            ChipLogProgress(NotSpecified, "うんこっこっこっこっこっこっこ")
+            SwitchOnOffAttributeUpdated(endpoint, newValue);
+        }
 
-        chip::BindingManager::GetInstance().NotifyBoundClusterChanged(endpoint, chip::app::Clusters::OnOff::Id, nullptr);
+        // chip::BindingManager::GetInstance().NotifyBoundClusterChanged(endpoint, chip::app::Clusters::OnOff::Id, nullptr);
+        // chip::BindingManager::GetInstance().NotifyBoundClusterChanged(endpoint, chip::app::Clusters::OnOff::Id, reinterpret_cast<void *>(newValue));
 
 #ifdef MATTER_DM_PLUGIN_LEVEL_CONTROL
         // If initiatedByLevelChange is false, then we assume that the level change
@@ -470,6 +477,10 @@ Status OnOffServer::setOnOffValue(chip::EndpointId endpoint, chip::CommandId com
             {
                 ChipLogProgress(Zcl, "ERR: writing on/off %x", to_underlying(status));
                 return status;
+            }
+            else{
+                ChipLogProgress(NotSpecified, "ちんこっこっこっこっこっこっこ")
+                SwitchOnOffAttributeUpdated(endpoint, newValue);
             }
 
             if (SupportsLightingApplications(endpoint))

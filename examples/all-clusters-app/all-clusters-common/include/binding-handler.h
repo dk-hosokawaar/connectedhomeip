@@ -18,5 +18,8 @@
 #pragma once
 
 #include "lib/core/CHIPError.h"
+#include <app/util/basic-types.h>
 
 CHIP_ERROR InitBindingHandlers();
+
+void SwitchOnOffAttributeUpdated(chip::EndpointId endpoint, bool value);

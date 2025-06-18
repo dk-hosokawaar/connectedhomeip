@@ -131,3 +131,12 @@ CHIP_ERROR InitBindingHandlers()
 #endif
     return CHIP_NO_ERROR;
 }
+
+
+void SwitchOnOffAttributeUpdated(chip::EndpointId endpoint, bool value)
+{
+    sSwitchOnOffState = value;           // ❶ 値を覚える
+    // ❷ ep のクラスタ変更をバインディング経由で相手へ通知
+    chip::BindingManager::GetInstance()
+        .NotifyBoundClusterChanged(endpoint, chip::app::Clusters::OnOff::Id, nullptr);
+}
