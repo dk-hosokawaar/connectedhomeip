@@ -131,18 +131,3 @@ CHIP_ERROR InitBindingHandlers()
 #endif
     return CHIP_NO_ERROR;
 }
-
-
-extern "C" void MatterPostAttributeChangeCallback(
-        const chip::app::ConcreteAttributePath & path,
-        uint8_t type, uint16_t size, uint8_t * value)
-{
-    using namespace chip::app::Clusters;
-    if (path.mEndpointId == 1 && path.mClusterId == OnOff::Id &&
-        path.mAttributeId == OnOff::Attributes::OnOff::Id)
-    {
-        sSwitchOnOffState = (*value != 0);   // 状態をキャッシュ
-        chip::BindingManager::GetInstance()
-            .NotifyBoundClusterChanged(path.mEndpointId, path.mClusterId, nullptr);
-    }
-}

@@ -27,6 +27,8 @@
 #include <app/util/util.h>
 #include <protocols/interaction_model/StatusCode.h>
 #include <tracing/macros.h>
+#include <app/clusters/bindings/BindingManager.h>
+
 
 #ifdef MATTER_DM_PLUGIN_SCENES_MANAGEMENT
 #include <app/clusters/scenes-server/scenes-server.h>
@@ -421,6 +423,8 @@ Status OnOffServer::setOnOffValue(chip::EndpointId endpoint, chip::CommandId com
             ChipLogProgress(Zcl, "ERR: writing on/off %x", to_underlying(status));
             return status;
         }
+
+        chip::BindingManager::GetInstance().NotifyBoundClusterChanged(endpoint, chip::app::Clusters::OnOff::Id, nullptr);
 
 #ifdef MATTER_DM_PLUGIN_LEVEL_CONTROL
         // If initiatedByLevelChange is false, then we assume that the level change
