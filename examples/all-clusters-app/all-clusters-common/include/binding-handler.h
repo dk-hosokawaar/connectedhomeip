@@ -16,10 +16,19 @@
  */
 
 #pragma once
-
+#include <app/OperationalSessionSetup.h>
 #include "lib/core/CHIPError.h"
 #include <app/util/basic-types.h>
 
 CHIP_ERROR InitBindingHandlers();
 
 void SwitchOnOffAttributeUpdated(chip::EndpointId endpoint, bool value);
+
+// ─── 前方宣言（cpp 側のヘルパを公開したい場合のみ）────────────
+namespace chip {
+class OperationalDeviceProxy;
+}
+struct EmberBindingTableEntry;   // <app/util/binding-table.h> にある
+
+void ReadPeerOnOff(const EmberBindingTableEntry & entry,
+                   chip::OperationalDeviceProxy & dev);
