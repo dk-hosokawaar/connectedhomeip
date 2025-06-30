@@ -72,7 +72,7 @@ void KickAllBindings()
  *         b) MinInterval=0 / MaxInterval=20 / keepSubscriptions=true
  * =======================================================================*/
 static void SubscribePeerOnOff(const EmberBindingTableEntry & entry, OperationalDeviceProxy & dev)
-{
+{        
     /* ---- ReadClient::Callback 実装 ---- */
     class SubCb : public ReadClient::Callback
     {
@@ -167,23 +167,23 @@ static void HandleBoundDeviceChanged(const EmberBindingTableEntry & binding,
      *     必要ならコメントを外して利用してください。
      */
 
-    // auto ok  = [](const ConcreteCommandPath &, const StatusIB &, const auto &) {};
-    // auto err = [](CHIP_ERROR e) { ChipLogError(NotSpecified, "Invoke NG: %s", ErrorStr(e)); };
+    auto ok  = [](const ConcreteCommandPath &, const StatusIB &, const auto &) {};
+    auto err = [](CHIP_ERROR e) { ChipLogError(NotSpecified, "Invoke NG: %s", ErrorStr(e)); };
 
-    // if (sSwitchOnOffState)
-    // {
-    //     Clusters::OnOff::Commands::On::Type cmd;
-    //     Controller::InvokeCommandRequest(peerDev->GetExchangeManager(),
-    //                                      peerDev->GetSecureSession().Value(),
-    //                                      binding.remote, cmd, ok, err);
-    // }
-    // else
-    // {
-    //     Clusters::OnOff::Commands::Off::Type cmd;
-    //     Controller::InvokeCommandRequest(peerDev->GetExchangeManager(),
-    //                                      peerDev->GetSecureSession().Value(),
-    //                                      binding.remote, cmd, ok, err);
-    // }
+    if (sSwitchOnOffState)
+    {
+        Clusters::OnOff::Commands::On::Type cmd;
+        Controller::InvokeCommandRequest(peerDev->GetExchangeManager(),
+                                         peerDev->GetSecureSession().Value(),
+                                         binding.remote, cmd, ok, err);
+    }
+    else
+    {
+        Clusters::OnOff::Commands::Off::Type cmd;
+        Controller::InvokeCommandRequest(peerDev->GetExchangeManager(),
+                                         peerDev->GetSecureSession().Value(),
+                                         binding.remote, cmd, ok, err);
+    }
 }
 static void HandleContextRelease(void *) {} // 現状は特に処理なし
 
@@ -245,12 +245,12 @@ CHIP_ERROR InitBindingHandlers()
  *      └─ アプリ側で OnOff 属性を書き換えた際に呼ぶヘルパ。
  *         - ローカル状態を保持し、バインディングを Notify。
  * =======================================================================*/
-void SwitchOnOffAttributeUpdated(EndpointId ep, bool value)
-{
-    sSwitchOnOffState = value;
-    BindingManager::GetInstance().NotifyBoundClusterChanged(
-        ep, Clusters::OnOff::Id, nullptr);
-}
+// void SwitchOnOffAttributeUpdated(EndpointId ep, bool value)
+// {
+//     sSwitchOnOffState = value;
+//     BindingManager::GetInstance().NotifyBoundClusterChanged(
+//         ep, Clusters::OnOff::Id, nullptr);
+// }
 
 void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & attributePath, uint8_t type, uint16_t size,
                                        uint8_t * value)
@@ -259,9 +259,12 @@ void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & 
     if (attributePath.mClusterId == OnOff::Id &&
         attributePath.mAttributeId == OnOff::Attributes::OnOff::Id)
     {
-        ChipLogProgress(NotSpecified, "しにたいたい")
-        // bool newVal = *value;
-        // SwitchOnOffAttributeUpdated(attributePath.mEndpointId, newVal);
-        // ChipLogProgress(NotSpecified, "OnOff changed => %d", newVal);
+        bool newVal = (*value != 0);
+        if (sSwitchOnOffState != newVal)           // ループ防止
+        {
+            sSwitchOnOffState = newVal;
+            BindingManager::GetInstance()
+                .NotifyBoundClusterChanged(attributePath.mEndpointId, OnOff::Id, nullptr);
+        }
     }
 }
