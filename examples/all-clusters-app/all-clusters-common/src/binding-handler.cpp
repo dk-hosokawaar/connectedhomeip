@@ -251,3 +251,17 @@ void SwitchOnOffAttributeUpdated(EndpointId ep, bool value)
     BindingManager::GetInstance().NotifyBoundClusterChanged(
         ep, Clusters::OnOff::Id, nullptr);
 }
+
+void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & attributePath, uint8_t type, uint16_t size,
+                                       uint8_t * value)
+{
+    using namespace chip::app::Clusters;
+    if (attributePath.mClusterId == OnOff::Id &&
+        attributePath.mAttributeId == OnOff::Attributes::OnOff::Id)
+    {
+        ChipLogProgress(NotSpecified, "しにたいたい")
+        // bool newVal = *value;
+        // SwitchOnOffAttributeUpdated(attributePath.mEndpointId, newVal);
+        // ChipLogProgress(NotSpecified, "OnOff changed => %d", newVal);
+    }
+}
