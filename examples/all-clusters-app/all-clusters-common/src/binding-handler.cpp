@@ -154,7 +154,7 @@ static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, Operati
                         static_cast<uint32_t>(path.mClusterId),
                         static_cast<uint32_t>(path.mAttributeId),
                         v);
-                        sLocalState.onOff = v;
+                    // sLocalState.onOff = v;
                 }
                 break;
             }
@@ -168,7 +168,7 @@ static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, Operati
                         static_cast<uint32_t>(path.mClusterId),
                         static_cast<uint32_t>(path.mAttributeId),
                         lvl);
-                    sLocalState.level = lvl;
+                    // sLocalState.level = lvl;
                 }
                 break;
             }
@@ -192,7 +192,7 @@ static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, Operati
 
     ReadPrepareParams params(dev.GetSecureSession().Value());
     params.mMinIntervalFloorSeconds   = 0;
-    params.mMaxIntervalCeilingSeconds = 20;
+    params.mMaxIntervalCeilingSeconds = 60;
     params.mKeepSubscriptions         = true;
 
     /* cluster 全体を購読 (AttributeId ワイルドカード) */
@@ -331,20 +331,19 @@ CHIP_ERROR InitBindingHandlers()
  * =======================================================================*/
 void MatterPostAttributeChangeCallback(const ConcreteAttributePath & path, uint8_t /*type*/, uint16_t /*size*/, uint8_t * val)
 {
-    ChipLogError(NotSpecified, "助けて")
     bool needNotify = false;
+    ChipLogError(NotSpecified, "かーっかっかかつおぶし");
 
     switch (path.mClusterId)
     {
     case Clusters::OnOff::Id: {
-        ChipLogError(NotSpecified, "シャングリラ")
         bool newVal = (*val != 0);
+        ChipLogError(NotSpecified, "旧=%d → 新=%d val=%02X", sLocalState.onOff, newVal, *val);
         if (sLocalState.onOff != newVal)
         {
             sLocalState.onOff = newVal;
             needNotify        = true;
         }
-        ChipLogError(NotSpecified, "ポンポンウェイウェイウェイ")
         break;
     }
     case Clusters::LevelControl::Id: {
@@ -363,6 +362,7 @@ void MatterPostAttributeChangeCallback(const ConcreteAttributePath & path, uint8
 
     if (needNotify)
     {
+        ChipLogError(NotSpecified, "シャイニングスタ")
         BindingManager::GetInstance().NotifyBoundClusterChanged(path.mEndpointId, path.mClusterId, nullptr);
     }
 
