@@ -126,7 +126,9 @@ void KickAllBindings()
 /* =======================================================================
  *  SubscribePeerAttribute() – 任意クラスタの属性を購読
  * =======================================================================*/
-static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, OperationalDeviceProxy & dev, ClusterId targetCluster)
+// static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, OperationalDeviceProxy & dev, ClusterId targetCluster)
+static void SubscribePeerAttribute(const EmberBindingTableEntry & entry,
+                                   OperationalDeviceProxy & dev)
 {
     class SubCb : public ReadClient::Callback
     {
@@ -196,7 +198,11 @@ static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, Operati
     params.mKeepSubscriptions         = true;
 
     /* cluster 全体を購読 (AttributeId ワイルドカード) */
-    AttributePathParams path{ entry.remote, targetCluster, kInvalidAttributeId };
+    // AttributePathParams path{ entry.remote, targetCluster, kInvalidAttributeId };
+    /* ── クラスタもワイルドカードにして EP 全体を購読 ── */
+    AttributePathParams path{ entry.remote,
+                              kInvalidClusterId,
+                              kInvalidAttributeId };
     params.mpAttributePathParamsList    = &path;
     params.mAttributePathParamsListSize = 1;
 
@@ -230,12 +236,14 @@ static void SendSyncedCommand(const EmberBindingTableEntry & binding, Operationa
     case Clusters::OnOff::Id: {
         if (cmd == Clusters::OnOff::Commands::On::Id)
         {
+            ChipLogError(NotSpecified, "ヘンダーソン")
             Clusters::OnOff::Commands::On::Type c;
             Controller::InvokeCommandRequest(dev->GetExchangeManager(), dev->GetSecureSession().Value(),
                                              binding.remote, c, ok, err);
         }
         else
         {
+            ChipLogError(NotSpecified, "でヘア")
             Clusters::OnOff::Commands::Off::Type c;
             Controller::InvokeCommandRequest(dev->GetExchangeManager(), dev->GetSecureSession().Value(),
                                              binding.remote, c, ok, err);
@@ -273,7 +281,8 @@ static void HandleBoundDeviceChanged(const EmberBindingTableEntry & binding, Ope
 
     ChipLogError(NotSpecified, "ワンピース")
     /* (1) 相手属性を購読 */
-    SubscribePeerAttribute(binding, *peerDev, cid);
+    // SubscribePeerAttribute(binding, *peerDev, cid);
+    SubscribePeerAttribute(binding, *peerDev);
 
     ChipLogError(NotSpecified, "ブルーノフェルナンデス")
     /* (2) 必要に応じてローカル→リモートの同期コマンド */
