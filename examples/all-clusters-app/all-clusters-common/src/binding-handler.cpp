@@ -1,19 +1,18 @@
 /*
- *  binding-handler.cpp – Device-to-Device Binding  (Subscribe 版 / Matter 1.4)
+ *  binding-handler.cpp – Device‑to‑Device Binding  (Subscribe variant / Matter 1.4)
  *  ───────────────────────────────────────────────────────────────────────────
- *  構成要約
- *    1. 起動直後         : KickAllBindings() で BindingTable を走査し、Notify 発火
- *    2. CASE セッション後 : HandleBoundDeviceChanged() 内で
- *         a) SubscribePeerOnOff()  … 相手の OnOff 属性を購読
- *         b) (任意)  ローカル状態同期コマンド ──★ 今はコメントアウトして無効
- *    3. Subscribe       : Min=0 / Max=20 秒。変化時は即、変化なしでも 20 秒で keep-alive
- *    4. 再接続          : SendAutoResubscribeRequest() + mKeepSubscriptions=true が自動対応
+ *  2025‑06‑30  汎用クラスタ対応版
  *
- *  変更履歴メモ
- *    • Matter 1.4 に合わせ Callback シグネチャ修正 (OnReportEnd/OnError)
- *    • ReadPrepareParams から mAutoResubscribe → mKeepSubscriptions へ置換
- *    • ReadPeerOnOff() は削除し、SubscribePeerOnOff() を直接使用
- *    • 初期化時に Off コマンドを送らないよう同期ロジックをコメントアウト
+ *  概要
+ *  ▸ BindingTable の clusterId をそのまま利用して、On/Off 固定を解消
+ *  ▸ 任意クラスタの属性を Subscribe (Min 0 / Max 20 s, keep‑alive)
+ *  ▸ 必要に応じてローカル→リモート同期コマンドを送出（クラスタ毎マッピング）
+ *
+ *  変更点（旧版 → 本版）
+ *    • KickAllBindings() から Clusters::OnOff::Id のハードコード削除
+ *    • SubscribePeerAttribute() を新設してワイルドカード購読をサポート
+ *    • HandleBoundDeviceChanged() を汎用化
+ *    • MatterPostAttributeChangeCallback() で clusterId を動的判定
  */
 
 #include "binding-handler.h"
@@ -22,13 +21,14 @@
 #include <app-common/zap-generated/ids/Clusters.h>
 #include <app/CommandSender.h>
 #include <app/InteractionModelEngine.h>
-#include <app/ReadClient.h>                       // 購読・読取を行うクライアント
-#include <app/clusters/bindings/BindingManager.h> // Binding テーブル管理
-#include <app/server/Server.h>                    // FabricTable / CASE SessionMgr 取得用
-#include <controller/InvokeInteraction.h>         // InvokeCommandRequest()
+#include <app/ReadClient.h>
+#include <app/clusters/bindings/BindingManager.h>
+#include <app/server/Server.h>
+#include <controller/InvokeInteraction.h>
 #include <platform/CHIPDeviceLayer.h>
 #include <platform/PlatformManager.h>
-#include <app/util/binding-table.h>               // EmberBindingTableEntry
+#include <app/util/binding-table.h>
+#include <inttypes.h> // PRIx32 用
 
 #if defined(ENABLE_CHIP_SHELL)
 #include <lib/shell/Engine.h>
@@ -37,234 +37,334 @@
 using namespace chip;
 using namespace chip::app;
 
-/* ───────────────────── Globals ──────────────────────
- *  モックスイッチ (EP-1) のローカル状態。Subscribe 後に
- *  相手の OnOff 値で上書きされるので、起動時は false 固定。
+/* ────────────────────── ローカル状態 ──────────────────────
+ *  クラスタごとの bool 状態を保持。ここではサンプルとして OnOff / LevelControl
+ *  (100 = ON / 0 = OFF) だけだが、必要に応じて拡張する。
  */
-static bool sSwitchOnOffState = false;
+namespace {
+struct LocalState
+{
+    bool onOff                      = false; // Clusters::OnOff
+    uint8_t level                   = 0;     // Clusters::LevelControl (0‑254)
+    /* 追加クラスタ用フィールド … */
+};
+static LocalState sLocalState;
+} // namespace
+
+/* ──────────────────── コマンドマッピング ─────────────────── */
+namespace {
+struct SyncCommandEntry
+{
+    ClusterId clusterId;
+    CommandId cmdOn;  // あるいは "有効化" を示すコマンド
+    CommandId cmdOff; // あるいは "無効化" を示すコマンド
+};
+
+constexpr SyncCommandEntry kSyncCmdTable[] = {
+    { Clusters::OnOff::Id,
+      Clusters::OnOff::Commands::On::Id,
+      Clusters::OnOff::Commands::Off::Id },
+
+    /* LevelControl は MoveToLevel コマンド (254=ON, 0=OFF) を使う */
+    { Clusters::LevelControl::Id,
+      Clusters::LevelControl::Commands::MoveToLevel::Id,
+      Clusters::LevelControl::Commands::MoveToLevel::Id },
+
+    /* 例: ColorControl を Hue 0/120° に切り替える */
+    { Clusters::ColorControl::Id,
+      Clusters::ColorControl::Commands::MoveToHue::Id,
+      Clusters::ColorControl::Commands::MoveToHue::Id }
+};
+
+static CommandId FindCmdOn(ClusterId cid)
+{
+    for (auto & e : kSyncCmdTable)
+        if (e.clusterId == cid)
+            return e.cmdOn;
+    return kInvalidCommandId;
+}
+
+static CommandId FindCmdOff(ClusterId cid)
+{
+    for (auto & e : kSyncCmdTable)
+        if (e.clusterId == cid)
+            return e.cmdOff;
+    return kInvalidCommandId;
+}
+} // namespace
 
 /* =======================================================================
- *  KickAllBindings()
- *      └─ Boot 時、BindingTable の全エントリへ NotifyBoundClusterChanged()
- *         を 1 回発火させるユーティリティ。
- *         Read/Subscribe のトリガである “Bound cluster changed” コールを
- *         疑似的に生成し、HandleBoundDeviceChanged() を呼び出させる。
+ *  KickAllBindings() – Boot 時に BindingTable の全エントリへ Notify
  * =======================================================================*/
 namespace {
 void KickAllBindings()
 {
-    constexpr ClusterId kOnOff = Clusters::OnOff::Id;
+    size_t idx = 0;
+    
     for (const EmberBindingTableEntry & e : BindingTable::GetInstance())
     {
-        if (e.type == MATTER_UNICAST_BINDING && e.clusterId.value_or(kOnOff) == kOnOff)
+        /* ---- ① BindingTable の内容を出力 ---- */
+        ChipLogError(NotSpecified,
+                    "[Bind %zu] type=%u fabric=%u localEP=%u → "
+                    "nodeId=0x" ChipLogFormatX64 " remoteEP=%u "
+                    "cluster=0x%08" PRIx32, idx,
+                    static_cast<unsigned>(e.type),
+                    static_cast<unsigned>(e.fabricIndex),
+                    static_cast<unsigned>(e.local),
+                    ChipLogValueX64(e.nodeId),                   // 64-bit ログマクロ :contentReference[oaicite:5]{index=5}
+                    static_cast<unsigned>(e.remote),
+                    static_cast<uint32_t>(e.clusterId.value_or(0)));
+        if (e.type == MATTER_UNICAST_BINDING)
         {
-            /* local EP の OnOff が「変わった」ことにして通知 */
-            BindingManager::GetInstance().NotifyBoundClusterChanged(e.local, kOnOff, nullptr);
+            ClusterId cid = e.clusterId.value_or(0 /* wildcard */);
+            BindingManager::GetInstance().NotifyBoundClusterChanged(e.local, cid, nullptr);
         }
     }
 }
 } // namespace
 
 /* =======================================================================
- *  SubscribePeerOnOff()
- *      └─ 指定バインディングの相手 EP/Cluster の OnOff 属性を購読する。
- *         a) ReadClient を Subscribe モードで生成
- *         b) MinInterval=0 / MaxInterval=20 / keepSubscriptions=true
+ *  SubscribePeerAttribute() – 任意クラスタの属性を購読
  * =======================================================================*/
-static void SubscribePeerOnOff(const EmberBindingTableEntry & entry, OperationalDeviceProxy & dev)
-{        
-    /* ---- ReadClient::Callback 実装 ---- */
+static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, OperationalDeviceProxy & dev, ClusterId targetCluster)
+{
     class SubCb : public ReadClient::Callback
     {
-        /* ReadClient のポインタを保持（削除フックで必要） */
         ReadClient * mClient = nullptr;
-      public:
+
+    public:
         void Attach(ReadClient * c) { mClient = c; }
 
-        /* 属性値レポートを受信したとき */
-        void OnAttributeData(const ConcreteDataAttributePath &,
-                             TLV::TLVReader * r,
-                             const StatusIB & st) override
+        void OnAttributeData(const ConcreteDataAttributePath & path, TLV::TLVReader * r,
+                             const StatusIB & status) override
         {
-            bool v = false;
-            if (st.mStatus == Protocols::InteractionModel::Status::Success &&
-                r && r->Get(v) == CHIP_NO_ERROR)
+            if (status.mStatus != Protocols::InteractionModel::Status::Success || r == nullptr)
+                return;
+
+            /* クラスタ毎に処理を振り分ける */
+            switch (path.mClusterId)
             {
-                ChipLogProgress(NotSpecified, "[SUB] Peer OnOff = %d", v);
-                /* ★必要ならここでローカル状態を合わせる */
-                sSwitchOnOffState = v;
+            case Clusters::OnOff::Id: {
+                bool v = false;
+                if (r->Get(v) == CHIP_NO_ERROR)
+                {
+                    ChipLogProgress(NotSpecified,
+                        "[SUB] EP=%u Clus=0x%04" PRIx32 " Attr=0x%04" PRIx32 "  Peer OnOff = %d",
+                        static_cast<unsigned>(path.mEndpointId),
+                        static_cast<uint32_t>(path.mClusterId),
+                        static_cast<uint32_t>(path.mAttributeId),
+                        v);
+                        sLocalState.onOff = v;
+                }
+                break;
+            }
+            case Clusters::LevelControl::Id: {
+                uint8_t lvl = 0;
+                if (r->Get(lvl) == CHIP_NO_ERROR)
+                {
+                    ChipLogProgress(NotSpecified,
+                        "[SUB] EP=%u Clus=0x%04" PRIx32 " Attr=0x%04" PRIx32 "  Peer Level = %u",
+                        static_cast<unsigned>(path.mEndpointId),
+                        static_cast<uint32_t>(path.mClusterId),
+                        static_cast<uint32_t>(path.mAttributeId),
+                        lvl);
+                    sLocalState.level = lvl;
+                }
+                break;
+            }
+            /* 他クラスタを追加 … */
+            default:
+                break;
             }
         }
-        /* ReportData チャンク終了 — Matter1.4 では空実装で可 */
         void OnReportEnd() override {}
-        void OnError(CHIP_ERROR e) override
-        {
-            ChipLogError(NotSpecified, "Subscribe error: %s", ErrorStr(e));
-        }
-        void OnDone(ReadClient * rc) override
-        {
-            /* ReadClient のライフサイクル終了：IME から登録解除 */
-            InteractionModelEngine::GetInstance()->RemoveReadClient(rc);
-        }
+        void OnError(CHIP_ERROR e) override { ChipLogError(NotSpecified, "Subscribe error: %s", ErrorStr(e)); }
+        void OnDone(ReadClient * rc) override { InteractionModelEngine::GetInstance()->RemoveReadClient(rc); }
     };
-    static SubCb sCb; // ★単一購読想定なので static で再利用
 
-    /* ---- ReadClient 生成 ----
-     *  コンストラクタで自動的に InteractionModelEngine へ登録される。
-     */
+    static SubCb sCb; // 単一購読想定 (必要なら動的確保に変更)
+
     ReadClient * rc = Platform::New<ReadClient>(InteractionModelEngine::GetInstance(),
-                                                dev.GetExchangeManager(),
-                                                sCb,
+                                                dev.GetExchangeManager(), sCb,
                                                 ReadClient::InteractionType::Subscribe);
     VerifyOrReturn(rc, ChipLogError(NotSpecified, "ReadClient OOM"));
-    sCb.Attach(rc); // コールバックへ逆参照を渡す
+    sCb.Attach(rc);
 
-    /* ---- Subscribe パラメータ ---- */
-    ReadPrepareParams p(dev.GetSecureSession().Value());
-    p.mMinIntervalFloorSeconds   = 0;   // 値が変化したら即レポート
-    p.mMaxIntervalCeilingSeconds = 20;  // 変化なくても ≤20 s で keep-alive
-    p.mKeepSubscriptions         = true;/* 切断 → 再接続時に自動再購読 */
+    ReadPrepareParams params(dev.GetSecureSession().Value());
+    params.mMinIntervalFloorSeconds   = 0;
+    params.mMaxIntervalCeilingSeconds = 20;
+    params.mKeepSubscriptions         = true;
 
-    /* 単一属性 (EP, Cluster, AttributeId) を購読 */
-    AttributePathParams path{ entry.remote,
-                              Clusters::OnOff::Id,
-                              Clusters::OnOff::Attributes::OnOff::Id };
-    p.mpAttributePathParamsList    = &path;
-    p.mAttributePathParamsListSize = 1;
+    /* cluster 全体を購読 (AttributeId ワイルドカード) */
+    AttributePathParams path{ entry.remote, targetCluster, kInvalidAttributeId };
+    params.mpAttributePathParamsList    = &path;
+    params.mAttributePathParamsListSize = 1;
 
-    /* ---- 送信 ---- */
-    CHIP_ERROR err = rc->SendAutoResubscribeRequest(std::move(p));
+    CHIP_ERROR err = rc->SendAutoResubscribeRequest(std::move(params));
     if (err != CHIP_NO_ERROR)
-    {
         ChipLogError(NotSpecified, "Subscribe failed: %s", ErrorStr(err));
-    }
+    
 }
 
 /* =======================================================================
- *  HandleBoundDeviceChanged()
- *      └─ CASE セッション確立直後、BindingManager 経由で呼ばれる。
- *         - OnOff 目的のユニキャスト Binding のみを対象とする。
- *         - 接続確認後、SubscribePeerOnOff() をコールする。
+ *  SendSyncedCommand() – ローカル状態に合わせてリモートへコマンド送信
  * =======================================================================*/
-static void HandleBoundDeviceChanged(const EmberBindingTableEntry & binding,
-                                     OperationalDeviceProxy       * peerDev,
-                                     void *)
+static void SendSyncedCommand(const EmberBindingTableEntry & binding, OperationalDeviceProxy * dev, ClusterId cid)
 {
-    /* 条件に合わない Binding は無視 */
-    if (binding.type != MATTER_UNICAST_BINDING ||
-        binding.local != 1 /* EP-1 */           ||
-        binding.clusterId.value_or(Clusters::OnOff::Id) != Clusters::OnOff::Id)
-        return;
+    CommandId cmd = kInvalidCommandId;
 
-    VerifyOrReturn(peerDev && peerDev->ConnectionReady(),
-                   ChipLogError(NotSpecified, "Peer not ready"));
+    if (cid == Clusters::OnOff::Id)
+        cmd = sLocalState.onOff ? FindCmdOn(cid) : FindCmdOff(cid);
+    else if (cid == Clusters::LevelControl::Id)
+        cmd = sLocalState.level > 0 ? FindCmdOn(cid) : FindCmdOff(cid);
+    /* 他クラスタ条件… */
 
-    /* (1) 相手 OnOff 属性の購読を開始 */
-    SubscribePeerOnOff(binding, *peerDev);
-
-    /* (2) ローカル → リモート 同期コマンド
-     *     起動直後に相手の状態を上書きしたくないため *無効化*。
-     *     必要ならコメントを外して利用してください。
-     */
+    if (cmd == kInvalidCommandId)
+        return; // 同期不要
 
     auto ok  = [](const ConcreteCommandPath &, const StatusIB &, const auto &) {};
     auto err = [](CHIP_ERROR e) { ChipLogError(NotSpecified, "Invoke NG: %s", ErrorStr(e)); };
 
-    if (sSwitchOnOffState)
+    switch (cid)
     {
-        Clusters::OnOff::Commands::On::Type cmd;
-        Controller::InvokeCommandRequest(peerDev->GetExchangeManager(),
-                                         peerDev->GetSecureSession().Value(),
-                                         binding.remote, cmd, ok, err);
+    case Clusters::OnOff::Id: {
+        if (cmd == Clusters::OnOff::Commands::On::Id)
+        {
+            Clusters::OnOff::Commands::On::Type c;
+            Controller::InvokeCommandRequest(dev->GetExchangeManager(), dev->GetSecureSession().Value(),
+                                             binding.remote, c, ok, err);
+        }
+        else
+        {
+            Clusters::OnOff::Commands::Off::Type c;
+            Controller::InvokeCommandRequest(dev->GetExchangeManager(), dev->GetSecureSession().Value(),
+                                             binding.remote, c, ok, err);
+        }
+        break;
     }
-    else
-    {
-        Clusters::OnOff::Commands::Off::Type cmd;
-        Controller::InvokeCommandRequest(peerDev->GetExchangeManager(),
-                                         peerDev->GetSecureSession().Value(),
-                                         binding.remote, cmd, ok, err);
+    case Clusters::LevelControl::Id: {
+        Clusters::LevelControl::Commands::MoveToLevel::Type c;
+        c.level  = (cmd == FindCmdOn(cid)) ? static_cast<uint8_t>(254) : static_cast<uint8_t>(0);
+        c.transitionTime = 0;
+        Controller::InvokeCommandRequest(dev->GetExchangeManager(), dev->GetSecureSession().Value(),
+                                         binding.remote, c, ok, err);
+        break;
     }
+    /* 他クラスタ送信用 case 追加 … */
+    default:
+        break;
+    }
+
+    ChipLogError(NotSpecified, "ディバラ")
 }
-static void HandleContextRelease(void *) {} // 現状は特に処理なし
 
 /* =======================================================================
- *  InitBindingHandlers()
- *      └─ BindingManager の初期化とハンドラ登録を
- *         Matter Platform スレッドで非同期実行するラッパー。
+ *  HandleBoundDeviceChanged() – CASE 接続後の初期処理
+ * =======================================================================*/
+static void HandleBoundDeviceChanged(const EmberBindingTableEntry & binding, OperationalDeviceProxy * peerDev, void *)
+{
+    if (binding.type != MATTER_UNICAST_BINDING || !peerDev || !peerDev->ConnectionReady()){
+        ChipLogError(NotSpecified, "椎名林檎！！")
+        return;
+    }
+
+    ChipLogError(NotSpecified, "ドラゴンボール！！")
+    ClusterId cid = binding.clusterId.value_or(0 /* wildcard */);
+
+    ChipLogError(NotSpecified, "ワンピース")
+    /* (1) 相手属性を購読 */
+    SubscribePeerAttribute(binding, *peerDev, cid);
+
+    ChipLogError(NotSpecified, "ブルーノフェルナンデス")
+    /* (2) 必要に応じてローカル→リモートの同期コマンド */
+    SendSyncedCommand(binding, peerDev, cid);
+    ChipLogError(NotSpecified, "マーカスラッシュフォード")
+}
+
+static void HandleContextRelease(void *) {}
+
+/* =======================================================================
+ *  InitBindingHandlers() – BindingManager 初期化ラッパ
  * =======================================================================*/
 static void InitBindingHandlerInternal(intptr_t)
 {
     auto & srv = Server::GetInstance();
-    BindingManager::GetInstance().Init(
-        { &srv.GetFabricTable(),
-          srv.GetCASESessionManager(),
-          &srv.GetPersistentStorage() });
+    BindingManager::GetInstance().Init({ &srv.GetFabricTable(), srv.GetCASESessionManager(), &srv.GetPersistentStorage() });
 
     BindingManager::GetInstance().RegisterBoundDeviceChangedHandler(HandleBoundDeviceChanged);
     BindingManager::GetInstance().RegisterBoundDeviceContextReleaseHandler(HandleContextRelease);
 
-    KickAllBindings(); // ★ここで疑似 Notify を発火
+    ChipLogError(NotSpecified, "シュバインシュタイガー")
+    KickAllBindings();
+    ChipLogError(NotSpecified, "トーマスミュラー")
 }
 
 CHIP_ERROR InitBindingHandlers()
 {
-    /* Matter スレッド (PlatformMgr) 上で実行 */
     DeviceLayer::PlatformMgr().ScheduleWork(InitBindingHandlerInternal);
 
 #if defined(ENABLE_CHIP_SHELL)
-    /* ---- shell コマンド: "switch on|off" ----
-     *      仮想スイッチ (EP-1) の OnOff 属性を書き換えて、
-     *      BindingManager へ Notify するテスト用。
-     */
+    /* shell command: "switch on|off" (OnOff テスト用) */
     using namespace Shell;
     const shell_command_t cmd = {
         [](int argc, char ** argv) -> CHIP_ERROR {
             if (argc == 1 && strcmp(argv[0], "on") == 0)
-                sSwitchOnOffState = true;
+                sLocalState.onOff = true;
             else if (argc == 1 && strcmp(argv[0], "off") == 0)
-                sSwitchOnOffState = false;
+                sLocalState.onOff = false;
             else
             {
                 streamer_printf(streamer_get(), "Usage: switch [on|off]\n");
                 return CHIP_NO_ERROR;
             }
-            /* ローカル属性が変わった扱いにし、バインディング先へ自動反映 */
-            BindingManager::GetInstance().NotifyBoundClusterChanged(
-                1 /* EP-1 */, Clusters::OnOff::Id, nullptr);
+            BindingManager::GetInstance().NotifyBoundClusterChanged(1 /* EP‑1 */, Clusters::OnOff::Id, nullptr);
             return CHIP_NO_ERROR;
         },
-        "switch", "switch [on|off]"
-    };
+        "switch", "switch [on|off]" };
     Engine::Root().RegisterCommands(&cmd, 1);
 #endif
     return CHIP_NO_ERROR;
 }
 
 /* =======================================================================
- *  SwitchOnOffAttributeUpdated()
- *      └─ アプリ側で OnOff 属性を書き換えた際に呼ぶヘルパ。
- *         - ローカル状態を保持し、バインディングを Notify。
+ *  MatterPostAttributeChangeCallback() – ローカル属性変更通知
  * =======================================================================*/
-// void SwitchOnOffAttributeUpdated(EndpointId ep, bool value)
-// {
-//     sSwitchOnOffState = value;
-//     BindingManager::GetInstance().NotifyBoundClusterChanged(
-//         ep, Clusters::OnOff::Id, nullptr);
-// }
-
-void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath & attributePath, uint8_t type, uint16_t size,
-                                       uint8_t * value)
+void MatterPostAttributeChangeCallback(const ConcreteAttributePath & path, uint8_t /*type*/, uint16_t /*size*/, uint8_t * val)
 {
-    using namespace chip::app::Clusters;
-    if (attributePath.mClusterId == OnOff::Id &&
-        attributePath.mAttributeId == OnOff::Attributes::OnOff::Id)
+    ChipLogError(NotSpecified, "助けて")
+    bool needNotify = false;
+
+    switch (path.mClusterId)
     {
-        bool newVal = (*value != 0);
-        if (sSwitchOnOffState != newVal)           // ループ防止
+    case Clusters::OnOff::Id: {
+        ChipLogError(NotSpecified, "シャングリラ")
+        bool newVal = (*val != 0);
+        if (sLocalState.onOff != newVal)
         {
-            sSwitchOnOffState = newVal;
-            BindingManager::GetInstance()
-                .NotifyBoundClusterChanged(attributePath.mEndpointId, OnOff::Id, nullptr);
+            sLocalState.onOff = newVal;
+            needNotify        = true;
         }
+        ChipLogError(NotSpecified, "ポンポンウェイウェイウェイ")
+        break;
     }
+    case Clusters::LevelControl::Id: {
+        uint8_t newLvl = *val;
+        if (sLocalState.level != newLvl)
+        {
+            sLocalState.level = newLvl;
+            needNotify        = true;
+        }
+        break;
+    }
+    /* 他クラスタ追加 … */
+    default:
+        break;
+    }
+
+    if (needNotify)
+    {
+        BindingManager::GetInstance().NotifyBoundClusterChanged(path.mEndpointId, path.mClusterId, nullptr);
+    }
+
+    ChipLogError(NotSpecified, "わからん")
 }
