@@ -44,12 +44,16 @@ using namespace chip::app;
 namespace {
 struct LocalState
 {
-    bool onOff                      = false; // Clusters::OnOff
-    uint8_t level                   = 0;     // Clusters::LevelControl (0‑254)
+    bool onOff                      = true; // Clusters::OnOff
+    uint8_t level                   = 254;     // Clusters::LevelControl (0‑254)
     /* 追加クラスタ用フィールド … */
 };
 static LocalState sLocalState;
 } // namespace
+
+namespace {
+std::unordered_set<uint64_t> sActiveSubs;
+}
 
 /* ──────────────────── コマンドマッピング ─────────────────── */
 namespace {
@@ -128,6 +132,13 @@ void KickAllBindings()
  * =======================================================================*/
 static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, OperationalDeviceProxy & dev, ClusterId targetCluster)
 {
+
+    const uint64_t key = (static_cast<uint64_t>(entry.nodeId) << 32) | targetCluster;
+    if (sActiveSubs.find(key) != sActiveSubs.end())
+        return;                           // 既に張ってある
+
+    sActiveSubs.insert(key);              // ここから先は初回だけ
+
     class SubCb : public ReadClient::Callback
     {
         ReadClient * mClient = nullptr;
@@ -192,7 +203,7 @@ static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, Operati
 
     ReadPrepareParams params(dev.GetSecureSession().Value());
     params.mMinIntervalFloorSeconds   = 0;
-    params.mMaxIntervalCeilingSeconds = 60;
+    params.mMaxIntervalCeilingSeconds = 300;
     params.mKeepSubscriptions         = true;
 
     /* cluster 全体を購読 (AttributeId ワイルドカード) */
@@ -230,12 +241,14 @@ static void SendSyncedCommand(const EmberBindingTableEntry & binding, Operationa
     case Clusters::OnOff::Id: {
         if (cmd == Clusters::OnOff::Commands::On::Id)
         {
+            ChipLogError(NotSpecified, "コロムアニ")
             Clusters::OnOff::Commands::On::Type c;
             Controller::InvokeCommandRequest(dev->GetExchangeManager(), dev->GetSecureSession().Value(),
                                              binding.remote, c, ok, err);
         }
         else
         {
+            ChipLogError(NotSpecified, "ヴらほびっち")
             Clusters::OnOff::Commands::Off::Type c;
             Controller::InvokeCommandRequest(dev->GetExchangeManager(), dev->GetSecureSession().Value(),
                                              binding.remote, c, ok, err);
@@ -333,6 +346,7 @@ void MatterPostAttributeChangeCallback(const ConcreteAttributePath & path, uint8
 {
     bool needNotify = false;
     ChipLogError(NotSpecified, "かーっかっかかつおぶし");
+    ChipLogError(NotSpecified, "これですこれ：%d", sLocalState.onOff);
 
     switch (path.mClusterId)
     {
