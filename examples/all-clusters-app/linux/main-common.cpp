@@ -64,6 +64,7 @@
 #include <system/SystemPacketBuffer.h>
 #include <transport/SessionManager.h>
 #include <transport/raw/PeerAddress.h>
+#include "aircon_bridge/aircon_bridge.h"
 
 #include <string>
 
@@ -263,6 +264,8 @@ void ApplicationInit()
     SetTagList(/* endpoint= */ 2, Span<const Clusters::Descriptor::Structs::SemanticTagStruct::Type>(gEp2TagList));
     SetTagList(/* endpoint= */ 3, Span<const Clusters::Descriptor::Structs::SemanticTagStruct::Type>(gEp3TagList));
     SetTagList(/* endpoint= */ 4, Span<const Clusters::Descriptor::Structs::SemanticTagStruct::Type>(gEp4TagList));
+
+    aircon_bridge::Init();   
 }
 
 void ApplicationShutdown()

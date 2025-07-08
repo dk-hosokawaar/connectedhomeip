@@ -29,6 +29,10 @@
 #include <platform/PlatformManager.h>
 #include <app/util/binding-table.h>
 #include <inttypes.h> // PRIx32 用
+#include "cluster-plugins/cluster_registry.h"
+#include "cluster-plugins/cluster_handler.h"
+#include <app/WriteClient.h>
+
 
 #if defined(ENABLE_CHIP_SHELL)
 #include <lib/shell/Engine.h>
@@ -36,66 +40,6 @@
 
 using namespace chip;
 using namespace chip::app;
-
-/* ────────────────────── ローカル状態 ──────────────────────
- *  クラスタごとの bool 状態を保持。ここではサンプルとして OnOff / LevelControl
- *  (100 = ON / 0 = OFF) だけだが、必要に応じて拡張する。
- */
-namespace {
-struct LocalState
-{
-    bool onOff                      = true; // Clusters::OnOff
-    uint8_t level                   = 254;     // Clusters::LevelControl (0‑254)
-    /* 追加クラスタ用フィールド … */
-};
-static LocalState sLocalState;
-} // namespace
-
-namespace {
-std::unordered_set<uint64_t> sActiveSubs;
-}
-
-/* ──────────────────── コマンドマッピング ─────────────────── */
-namespace {
-struct SyncCommandEntry
-{
-    ClusterId clusterId;
-    CommandId cmdOn;  // あるいは "有効化" を示すコマンド
-    CommandId cmdOff; // あるいは "無効化" を示すコマンド
-};
-
-constexpr SyncCommandEntry kSyncCmdTable[] = {
-    { Clusters::OnOff::Id,
-      Clusters::OnOff::Commands::On::Id,
-      Clusters::OnOff::Commands::Off::Id },
-
-    /* LevelControl は MoveToLevel コマンド (254=ON, 0=OFF) を使う */
-    { Clusters::LevelControl::Id,
-      Clusters::LevelControl::Commands::MoveToLevel::Id,
-      Clusters::LevelControl::Commands::MoveToLevel::Id },
-
-    /* 例: ColorControl を Hue 0/120° に切り替える */
-    { Clusters::ColorControl::Id,
-      Clusters::ColorControl::Commands::MoveToHue::Id,
-      Clusters::ColorControl::Commands::MoveToHue::Id }
-};
-
-static CommandId FindCmdOn(ClusterId cid)
-{
-    for (auto & e : kSyncCmdTable)
-        if (e.clusterId == cid)
-            return e.cmdOn;
-    return kInvalidCommandId;
-}
-
-static CommandId FindCmdOff(ClusterId cid)
-{
-    for (auto & e : kSyncCmdTable)
-        if (e.clusterId == cid)
-            return e.cmdOff;
-    return kInvalidCommandId;
-}
-} // namespace
 
 /* =======================================================================
  *  KickAllBindings() – Boot 時に BindingTable の全エントリへ Notify
@@ -133,12 +77,6 @@ void KickAllBindings()
 static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, OperationalDeviceProxy & dev, ClusterId targetCluster)
 {
 
-    const uint64_t key = (static_cast<uint64_t>(entry.nodeId) << 32) | targetCluster;
-    if (sActiveSubs.find(key) != sActiveSubs.end())
-        return;                           // 既に張ってある
-
-    sActiveSubs.insert(key);              // ここから先は初回だけ
-
     class SubCb : public ReadClient::Callback
     {
         ReadClient * mClient = nullptr;
@@ -152,40 +90,8 @@ static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, Operati
             if (status.mStatus != Protocols::InteractionModel::Status::Success || r == nullptr)
                 return;
 
-            /* クラスタ毎に処理を振り分ける */
-            switch (path.mClusterId)
-            {
-            case Clusters::OnOff::Id: {
-                bool v = false;
-                if (r->Get(v) == CHIP_NO_ERROR)
-                {
-                    ChipLogProgress(NotSpecified,
-                        "[SUB] EP=%u Clus=0x%04" PRIx32 " Attr=0x%04" PRIx32 "  Peer OnOff = %d",
-                        static_cast<unsigned>(path.mEndpointId),
-                        static_cast<uint32_t>(path.mClusterId),
-                        static_cast<uint32_t>(path.mAttributeId),
-                        v);
-                    // sLocalState.onOff = v;
-                }
-                break;
-            }
-            case Clusters::LevelControl::Id: {
-                uint8_t lvl = 0;
-                if (r->Get(lvl) == CHIP_NO_ERROR)
-                {
-                    ChipLogProgress(NotSpecified,
-                        "[SUB] EP=%u Clus=0x%04" PRIx32 " Attr=0x%04" PRIx32 "  Peer Level = %u",
-                        static_cast<unsigned>(path.mEndpointId),
-                        static_cast<uint32_t>(path.mClusterId),
-                        static_cast<uint32_t>(path.mAttributeId),
-                        lvl);
-                    // sLocalState.level = lvl;
-                }
-                break;
-            }
-            /* 他クラスタを追加 … */
-            default:
-                break;
+            if (auto* h = GetHandler(path.mClusterId)) {
+                h->OnRemoteAttribute(path, r);
             }
         }
         void OnReportEnd() override {}
@@ -217,59 +123,6 @@ static void SubscribePeerAttribute(const EmberBindingTableEntry & entry, Operati
     
 }
 
-/* =======================================================================
- *  SendSyncedCommand() – ローカル状態に合わせてリモートへコマンド送信
- * =======================================================================*/
-static void SendSyncedCommand(const EmberBindingTableEntry & binding, OperationalDeviceProxy * dev, ClusterId cid)
-{
-    CommandId cmd = kInvalidCommandId;
-
-    if (cid == Clusters::OnOff::Id)
-        cmd = sLocalState.onOff ? FindCmdOn(cid) : FindCmdOff(cid);
-    else if (cid == Clusters::LevelControl::Id)
-        cmd = sLocalState.level > 0 ? FindCmdOn(cid) : FindCmdOff(cid);
-    /* 他クラスタ条件… */
-
-    if (cmd == kInvalidCommandId)
-        return; // 同期不要
-
-    auto ok  = [](const ConcreteCommandPath &, const StatusIB &, const auto &) {};
-    auto err = [](CHIP_ERROR e) { ChipLogError(NotSpecified, "Invoke NG: %s", ErrorStr(e)); };
-
-    switch (cid)
-    {
-    case Clusters::OnOff::Id: {
-        if (cmd == Clusters::OnOff::Commands::On::Id)
-        {
-            ChipLogError(NotSpecified, "コロムアニ")
-            Clusters::OnOff::Commands::On::Type c;
-            Controller::InvokeCommandRequest(dev->GetExchangeManager(), dev->GetSecureSession().Value(),
-                                             binding.remote, c, ok, err);
-        }
-        else
-        {
-            ChipLogError(NotSpecified, "ヴらほびっち")
-            Clusters::OnOff::Commands::Off::Type c;
-            Controller::InvokeCommandRequest(dev->GetExchangeManager(), dev->GetSecureSession().Value(),
-                                             binding.remote, c, ok, err);
-        }
-        break;
-    }
-    case Clusters::LevelControl::Id: {
-        Clusters::LevelControl::Commands::MoveToLevel::Type c;
-        c.level  = (cmd == FindCmdOn(cid)) ? static_cast<uint8_t>(254) : static_cast<uint8_t>(0);
-        c.transitionTime = 0;
-        Controller::InvokeCommandRequest(dev->GetExchangeManager(), dev->GetSecureSession().Value(),
-                                         binding.remote, c, ok, err);
-        break;
-    }
-    /* 他クラスタ送信用 case 追加 … */
-    default:
-        break;
-    }
-
-    ChipLogError(NotSpecified, "ディバラ")
-}
 
 /* =======================================================================
  *  HandleBoundDeviceChanged() – CASE 接続後の初期処理
@@ -281,17 +134,14 @@ static void HandleBoundDeviceChanged(const EmberBindingTableEntry & binding, Ope
         return;
     }
 
-    ChipLogError(NotSpecified, "ドラゴンボール！！")
     ClusterId cid = binding.clusterId.value_or(0 /* wildcard */);
 
-    ChipLogError(NotSpecified, "ワンピース")
     /* (1) 相手属性を購読 */
     SubscribePeerAttribute(binding, *peerDev, cid);
 
-    ChipLogError(NotSpecified, "ブルーノフェルナンデス")
     /* (2) 必要に応じてローカル→リモートの同期コマンド */
-    SendSyncedCommand(binding, peerDev, cid);
-    ChipLogError(NotSpecified, "マーカスラッシュフォード")
+    if (auto* h = GetHandler(cid))
+        h->SyncToRemote(binding, peerDev);
 }
 
 static void HandleContextRelease(void *) {}
@@ -307,9 +157,7 @@ static void InitBindingHandlerInternal(intptr_t)
     BindingManager::GetInstance().RegisterBoundDeviceChangedHandler(HandleBoundDeviceChanged);
     BindingManager::GetInstance().RegisterBoundDeviceContextReleaseHandler(HandleContextRelease);
 
-    ChipLogError(NotSpecified, "シュバインシュタイガー")
     KickAllBindings();
-    ChipLogError(NotSpecified, "トーマスミュラー")
 }
 
 CHIP_ERROR InitBindingHandlers()
@@ -321,15 +169,15 @@ CHIP_ERROR InitBindingHandlers()
     using namespace Shell;
     const shell_command_t cmd = {
         [](int argc, char ** argv) -> CHIP_ERROR {
-            if (argc == 1 && strcmp(argv[0], "on") == 0)
-                sLocalState.onOff = true;
-            else if (argc == 1 && strcmp(argv[0], "off") == 0)
-                sLocalState.onOff = false;
-            else
-            {
-                streamer_printf(streamer_get(), "Usage: switch [on|off]\n");
-                return CHIP_NO_ERROR;
-            }
+            // if (argc == 1 && strcmp(argv[0], "on") == 0)
+            //     sLocalState.onOff = true;
+            // else if (argc == 1 && strcmp(argv[0], "off") == 0)
+            //     sLocalState.onOff = false;
+            // else
+            // {
+            //     streamer_printf(streamer_get(), "Usage: switch [on|off]\n");
+            //     return CHIP_NO_ERROR;
+            // }
             BindingManager::GetInstance().NotifyBoundClusterChanged(1 /* EP‑1 */, Clusters::OnOff::Id, nullptr);
             return CHIP_NO_ERROR;
         },
@@ -342,43 +190,46 @@ CHIP_ERROR InitBindingHandlers()
 /* =======================================================================
  *  MatterPostAttributeChangeCallback() – ローカル属性変更通知
  * =======================================================================*/
-void MatterPostAttributeChangeCallback(const ConcreteAttributePath & path, uint8_t /*type*/, uint16_t /*size*/, uint8_t * val)
-{
-    bool needNotify = false;
-    ChipLogError(NotSpecified, "かーっかっかかつおぶし");
-    ChipLogError(NotSpecified, "これですこれ：%d", sLocalState.onOff);
+// void MatterPostAttributeChangeCallback(const ConcreteAttributePath & path, uint8_t /*type*/, uint16_t /*size*/, uint8_t * val)
+// {
 
-    switch (path.mClusterId)
-    {
-    case Clusters::OnOff::Id: {
-        bool newVal = (*val != 0);
-        ChipLogError(NotSpecified, "旧=%d → 新=%d val=%02X", sLocalState.onOff, newVal, *val);
-        if (sLocalState.onOff != newVal)
-        {
-            sLocalState.onOff = newVal;
-            needNotify        = true;
-        }
-        break;
-    }
-    case Clusters::LevelControl::Id: {
-        uint8_t newLvl = *val;
-        if (sLocalState.level != newLvl)
-        {
-            sLocalState.level = newLvl;
-            needNotify        = true;
-        }
-        break;
-    }
-    /* 他クラスタ追加 … */
-    default:
-        break;
-    }
+//     if (auto* h = GetHandler(path.mClusterId)) {
+//         chip::TLV::TLVReader tmp;
+//         // Reader をセットアップ（割愛）
+//         h->OnLocalAttributeChange(path, &tmp);
+//         ChipLogError(NotSpecified, "ちゅぽもてぃんぐ")
+//     } else {
+//         // ハンドラ無しクラスタだけ中央で通知
+//         BindingManager::GetInstance().NotifyBoundClusterChanged(
+//             path.mEndpointId, path.mClusterId, nullptr);
+//         ChipLogError(NotSpecified, "ナインゴラン")
+//     }
 
-    if (needNotify)
-    {
-        ChipLogError(NotSpecified, "シャイニングスタ")
-        BindingManager::GetInstance().NotifyBoundClusterChanged(path.mEndpointId, path.mClusterId, nullptr);
-    }
+//     ChipLogError(NotSpecified, "わからん")
+// }
 
-    ChipLogError(NotSpecified, "わからん")
-}
+// static CHIP_ERROR MirrorAttributeWrite(const EmberBindingTableEntry& entry,
+//                                        chip::TLV::TLVReader* reader)
+// {
+//     using namespace chip;
+//     using namespace chip::app;
+//     Messaging::ExchangeManager* em = Server::GetInstance().GetExchangeManager();
+
+//     // ❶ WriteClient の生成（レスポンス抑止）
+//     WriteClient wc(em, nullptr /* callback */,
+//                    chip::NullOptional /* timedWriteTimeoutMs */,
+//                    /* suppressResponse = */ true);
+
+//     // ❷ AttributeDataIBs をエンコード
+//     AttributePathParams path{ entry.remote,
+//                               entry.clusterId.ValueOr(kInvalidClusterId),
+//                               kInvalidAttributeId };          // 全属性
+
+//     AttributeDataIB dataIb;
+//     dataIb.DataVersion.SetNull();          // DataVersion は省略
+//     dataIb.Data = *reader;                 // 受信 TLV をそのままコピー
+
+//     ReturnErrorOnFailure(wc.EncodeAttribute(path, dataIb));
+//     ReturnErrorOnFailure(wc.Finish());     // パケット確定
+//     return CHIP_NO_ERROR;                  // fire-and-forget
+// }
