@@ -87,6 +87,13 @@ source_set("chip-all-clusters-common") {
     "include/tv-callbacks.cpp",
     "include/tv-callbacks.h",
     "main-common.cpp",
+    "${chip_root}/examples/all-clusters-app/all-clusters-common/src/cluster-plugins/cluster_registry.cpp",
+    "${chip_root}/examples/all-clusters-app/all-clusters-common/src/cluster-plugins/onoff_handler.cpp",
+    "${chip_root}/examples/all-clusters-app/all-clusters-common/src/thermostat-delegate-impl.cpp",
+    "aircon_bridge/external_temp_provider.cpp",
+    "${chip_root}/examples/all-clusters-app/all-clusters-common/src/cluster-plugins/thermostat_handler.cpp",
+    "${chip_root}/examples/all-clusters-app/all-clusters-common/src/app-zcl-handler.cpp",
+    "${chip_root}/examples/all-clusters-app/all-clusters-common/src/generic_empty_stubs.cpp",
   ]
 
   deps = [
