@@ -225,3 +225,4 @@ void ThermostatDelegate::ClearPendingPresetList()
 {
     mNextFreeIndexInPendingPresetsList = 0;
 }
+
